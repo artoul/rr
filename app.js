@@ -492,7 +492,7 @@ function setupEventListeners() {
                 loadingThumb.appendChild(stage);
                 loadingThumb.appendChild(pbar);
                 thumbContainer.appendChild(loadingThumb);
-                thumbnailsGrid.appendChild(thumbContainer);
+                thumbnailsGrid.prepend(thumbContainer);
             }
             // Scroll to the thumbnails area so the user sees generation progress
             if (thumbnailsGrid && typeof thumbnailsGrid.scrollIntoView === 'function') {
@@ -856,7 +856,7 @@ async function generateServerThumbnails(titleObj, references, quantity, isAdditi
     }
     
     // Get the starting index for new thumbnails
-    const startIndex = isAdditional ? titleObj.thumbnails.length : 0;
+    const startIndex = titleObj.thumbnails.length;
     
     // Setup loading thumbnails
     for (let i = 0; i < quantity; i++) {
@@ -887,7 +887,7 @@ async function generateServerThumbnails(titleObj, references, quantity, isAdditi
     try {
         // Directly start image generation (legacy simulated path)
         if (progressStatus) progressStatus.textContent = 'Generating images...';
-        const newThumbnails = await ServerAPI.generateThumbnails(titleObj, references, quantity, startIndex);
+        const newThumbnails = await ServerAPI.generateThumbnails(titleObj, references, quantity);
         
         // After all thumbnails are generated
         progressSection.style.display = 'none';
@@ -1057,8 +1057,8 @@ function renderThumbnail(thumbnailData, index) {
     actions.appendChild(downloadBtn);
     actions.appendChild(regenerateBtn);
     
-    thumbContainer.appendChild(img);
-    thumbContainer.appendChild(actions);
+    thumbContainer.prepend(img);
+    thumbContainer.prepend(actions);
     
     // Add click event to view prompt details
     thumbContainer.addEventListener('click', () => {
@@ -1483,7 +1483,7 @@ async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
                                 container = document.createElement('div');
                                 container.className = 'thumbnail-item';
                                 container.id = id;
-                                thumbnailsGrid.appendChild(container);
+                                thumbnailsGrid.prepend(container);
                                 existingCount += 1;
                             }
                             renderThumbnail(t, idx);
