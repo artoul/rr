@@ -73,7 +73,17 @@ async function generateImage(ideaId, prompt, references = []) {
     let response;
 
     // Limit reference images to reduce payload and processing time
-    const refsToUse = (Array.isArray(references) ? references : []).slice(0, MAX_REFERENCE_IMAGES);
+    // Shuffle and randomly choose a subset to increase variation between runs
+    const refsArray = Array.isArray(references) ? [...references] : [];
+    for (let i = refsArray.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = refsArray[i];
+      refsArray[i] = refsArray[j];
+      refsArray[j] = tmp;
+    }
+    const maxRefCount = Math.min(MAX_REFERENCE_IMAGES, refsArray.length);
+    const chosenCount = maxRefCount > 0 ? Math.floor(Math.random() * (maxRefCount + 1)) : 0; // 0..maxRefCount
+    const refsToUse = refsArray.slice(0, chosenCount);
     
     if (refsToUse && refsToUse.length > 0) {
       console.log(`Using ${refsToUse.length} reference images for edits endpoint`);

@@ -112,11 +112,23 @@ async function generatePaintings(req, res) {
 
         // If skipping idea generation, derive prompts directly from title and instructions
         if (skipIdeas === true || String(process.env.SKIP_IDEA_GENERATION).toLowerCase() === 'true') {
+          const styleVariations = [
+            'Bold complementary colors, high contrast, dramatic lighting.',
+            'Muted pastel palette, soft gradients, minimalistic composition.',
+            'Abstract geometric forms, asymmetry, emphasis on negative space.',
+            'Textured brushstroke effect, painterly style, warm tones.',
+            'Futuristic neon palette, cyberpunk mood, high saturation.',
+            'Monochrome noir, strong chiaroscuro, cinematic framing.',
+            'Organic shapes, nature-inspired patterns, earthy tones.',
+            'Surreal composition, unexpected scale, dreamlike atmosphere.'
+          ];
           for (const ideaId of stubIdeaIds) {
             const derivedSummary = title.title;
-            const derivedFullPrompt = title.instructions && title.instructions.trim().length > 0
+            const variation = styleVariations[Math.floor(Math.random() * styleVariations.length)];
+            const basePrompt = title.instructions && title.instructions.trim().length > 0
               ? `${title.title}. ${title.instructions}`
               : `${title.title}`;
+            const derivedFullPrompt = `${basePrompt}\nStyle variation: ${variation}`;
             await pool.execute(
               'UPDATE ideas SET summary = ?, full_prompt = ? WHERE id = ?',
               [derivedSummary, derivedFullPrompt, ideaId]
