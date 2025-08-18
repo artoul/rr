@@ -497,13 +497,7 @@ function setupEventListeners() {
                 thumbnailsGrid.appendChild(thumbContainer);
             }
 
-            // Set header pill to show running count immediately
-            if (jobPill) {
-                const current = parseInt(jobPill?.dataset?.count || '0', 10);
-                const next = current + quantity;
-                jobPill.dataset.count = String(next);
-                jobPill.textContent = `${next} running`;
-            }
+            // Header pill is derived from server state only; no optimistic bump
 
             // Generate thumbnails
             console.log("Generating thumbnails for title ID:", currentTitle.id, "Quantity:", quantity);
@@ -1414,8 +1408,8 @@ async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
             if (containerExists) renderThumbnail(thumbnail, index);
         });
 
-        // Set header running count based on server statuses
-        const runningCountInit = relevantThumbnails.filter(t => t.status === 'pending' || t.status === 'processing').length;
+        // Set header running count based on server statuses (only actively processing)
+        const runningCountInit = relevantThumbnails.filter(t => t.status === 'processing').length;
         if (jobPill) {
             jobPill.dataset.count = String(runningCountInit);
             jobPill.textContent = `${runningCountInit} running`;
@@ -1429,19 +1423,10 @@ async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
             try {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'jobStarted') {
-                    if (jobPill) {
-                        const current = parseInt(jobPill.dataset.count || '0', 10) + (msg.payload?.quantity || 0);
-                        jobPill.dataset.count = String(current);
-                        jobPill.textContent = `${current} running`;
-                    }
+                    // no-op: rely on recompute in paintingUpdated
                 }
                 if (msg.type === 'paintingCreated') {
                     ai2Status.textContent = 'Creating images...';
-                    if (jobPill) {
-                        const current = parseInt(jobPill.dataset.count || '0', 10) + 1;
-                        jobPill.dataset.count = String(current);
-                        jobPill.textContent = `${current} running`;
-                    }
                 }
                 if (msg.type === 'paintingUpdated') {
                     // Reload thumbnails list to get ordering and reference map (could optimize)
@@ -1454,7 +1439,7 @@ async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
                             if (containerExists) renderThumbnail(t, idx);
                         });
                         const completed = rel.filter(t => t.status === 'completed' || t.status === 'failed').length;
-                        const running = rel.filter(t => t.status === 'pending' || t.status === 'processing').length;
+                        const running = rel.filter(t => t.status === 'processing').length; // only actively generating
                         ai2Status.textContent = `Creating images... ${completed}/${rel.length} complete`;
                         ai2Progress.style.width = `${rel.length ? (completed / rel.length) * 100 : 0}%`;
                         if (jobPill) {
@@ -1477,13 +1462,7 @@ async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
                     });
                 }
                 if (msg.type === 'jobCompleted' || msg.type === 'jobFailed') {
-                    if (jobPill) {
-                        const current = parseInt(jobPill.dataset.count || '0', 10);
-                        const dec = expectedQuantity || 0;
-                        const next = Math.max(0, current - dec);
-                        jobPill.dataset.count = String(next);
-                        jobPill.textContent = `${next} running`;
-                    }
+                    // no-op: final recompute happens above
                 }
             } catch (err) {
                 console.warn('SSE message parse error', err);

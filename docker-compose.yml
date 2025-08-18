@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    image: rr-app:latest
+    container_name: rr-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./uploads:/usr/src/app/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  db:
+    image: mysql:8.0
+    container_name: rr-mysql
+    restart: unless-stopped
+    profiles: ["with-db"]
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-painting_generator}
+      MYSQL_USER: ${DB_USER:-root}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-root}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+    ports:
+      - "3306:3306"
+    volumes:
+      - rr-mysql-data:/var/lib/mysql
+
+volumes:
+  rr-mysql-data:
+
+

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
 const { pool } = require('../database');
+const sse = require('../services/sse');
 require('dotenv').config();
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -42,6 +43,17 @@ async function generateImage(ideaId, prompt, references = []) {
       statusUpdateParams
     );
     console.log(`Updated status to processing for idea ${ideaId}`);
+
+    // Publish SSE update for processing state so clients can recompute running count
+    try {
+      const [rows] = await pool.execute('SELECT title_id FROM ideas WHERE id = ?', [ideaId]);
+      const titleIdForSse = rows && rows[0] && rows[0].title_id;
+      if (titleIdForSse) {
+        sse.publish(titleIdForSse, { type: 'paintingUpdated', payload: { ideaId, status: 'processing' } });
+      }
+    } catch (e) {
+      console.warn('Failed to publish processing SSE update:', e?.message || e);
+    }
 
     let response;
     
