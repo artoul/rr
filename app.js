@@ -3,7 +3,8 @@ import {
   login, register, getProfile, 
   createTitle, getTitles, getTitle, updateTitle, deleteTitle,
   uploadReference, getReferences, getGlobalReferences, deleteReference,
-  generateThumbnails as generatePaintings, getThumbnails as getPaintings
+  generateThumbnails as generatePaintings, getThumbnails as getPaintings,
+  streamPaintings
 } from './frontend/apiService.js';
 
 // Simulated Server API
@@ -226,6 +227,9 @@ const referenceCount = document.getElementById('reference-count');
 const referenceThumbnails = document.getElementById('reference-thumbnails');
 const fullPrompt = document.getElementById('full-prompt');
 const loadingOverlay = document.getElementById('loading-overlay');
+const connectionStatus = document.getElementById('connection-status');
+const jobPill = document.getElementById('job-pill');
+const toastContainer = document.getElementById('toast-container');
 
 // Callback to handle when a thumbnail is ready
 let thumbnailReady = null;
@@ -285,6 +289,16 @@ function showLoading(show) {
     buttons.forEach(button => {
         button.disabled = show;
     });
+}
+
+// Toast notifications
+function showToast(message) {
+    if (!toastContainer) return;
+    const t = document.createElement('div');
+    t.className = 'toast';
+    t.textContent = message;
+    toastContainer.appendChild(t);
+    setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 3500);
 }
 
 // Load user data from server
@@ -458,6 +472,39 @@ function setupEventListeners() {
                 }
             }
             
+            // Prepare UI: show progress and create placeholders
+            progressSection.style.display = 'block';
+            thumbnailsEmptyState.style.display = 'none';
+            thumbnailsGrid.innerHTML = '';
+            for (let i = 0; i < quantity; i++) {
+                const thumbContainer = document.createElement('div');
+                thumbContainer.className = 'thumbnail-item';
+                thumbContainer.id = `thumb-${i}`;
+                const loadingThumb = document.createElement('div');
+                loadingThumb.className = 'loading-thumbnail';
+                const stage = document.createElement('div');
+                stage.className = 'thumbnail-stage';
+                stage.textContent = 'Creating prompt...';
+                const pbar = document.createElement('div');
+                pbar.className = 'progress-bar';
+                const pfill = document.createElement('div');
+                pfill.className = 'progress-fill';
+                pfill.style.width = '10%';
+                pbar.appendChild(pfill);
+                loadingThumb.appendChild(stage);
+                loadingThumb.appendChild(pbar);
+                thumbContainer.appendChild(loadingThumb);
+                thumbnailsGrid.appendChild(thumbContainer);
+            }
+
+            // Set header pill to show running count immediately
+            if (jobPill) {
+                const current = parseInt(jobPill?.dataset?.count || '0', 10);
+                const next = current + quantity;
+                jobPill.dataset.count = String(next);
+                jobPill.textContent = `${next} running`;
+            }
+
             // Generate thumbnails
             console.log("Generating thumbnails for title ID:", currentTitle.id, "Quantity:", quantity);
             const generateResponse = await generatePaintings(currentTitle.id, quantity);
@@ -465,6 +512,9 @@ function setupEventListeners() {
             
             // Start polling for thumbnail status instead of loading immediately
             pollThumbnailStatus(currentTitle.id, quantity);
+
+            // Remove global loading overlay immediately; progress UI will show live updates
+            showLoading(false);
 
             // Refresh titles list after starting generation/polling
             console.log("Refreshing titles list");
@@ -502,21 +552,17 @@ function setupEventListeners() {
     moreThumbnailsBtn.addEventListener('click', async () => {
         if (!currentTitle) return;
         
-        showLoading(true);
-        
         try {
             const quantity = parseInt(quantitySelect.value) || 3;
             
-            // Generate more thumbnails
+            // Enqueue more thumbnails (returns immediately)
             await generatePaintings(currentTitle.id, quantity);
             
-            // Get the updated thumbnails
-            await loadThumbnails(currentTitle.id);
+            // Start/renew SSE stream to reflect new items progressively
+            pollThumbnailStatus(currentTitle.id, quantity);
         } catch (error) {
             console.error('Error generating more thumbnails:', error);
             alert('Failed to generate additional thumbnails. Please try again.');
-        } finally {
-            showLoading(false);
         }
     });
     
@@ -943,6 +989,25 @@ function renderThumbnail(thumbnailData, index) {
     thumbContainer.innerHTML = '';
     thumbContainer.dataset.id = thumbnailData.id;
     
+    // When image not yet available, show per-item stage/progress
+    if (!thumbnailData.image_url || thumbnailData.status === 'pending' || thumbnailData.status === 'processing') {
+        const loadingThumb = document.createElement('div');
+        loadingThumb.className = 'loading-thumbnail';
+        const stage = document.createElement('div');
+        stage.className = 'thumbnail-stage';
+        stage.textContent = thumbnailData.status === 'pending' ? 'Creating prompt...' : 'Creating image...';
+        const bar = document.createElement('div');
+        bar.className = 'progress-bar';
+        const fill = document.createElement('div');
+        fill.className = 'progress-fill';
+        fill.style.width = thumbnailData.status === 'pending' ? '15%' : '60%';
+        bar.appendChild(fill);
+        loadingThumb.appendChild(stage);
+        loadingThumb.appendChild(bar);
+        thumbContainer.appendChild(loadingThumb);
+        return;
+    }
+
     if (thumbnailData.status === 'failed') {
         // Show error state for failed thumbnails
         const errorDiv = document.createElement('div');
@@ -1334,100 +1399,126 @@ async function loadThumbnails(titleId) {
 
 // Poll for thumbnail generation status
 async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
-    console.log(`[Poll #${attempt + 1}] Entered pollThumbnailStatus for title ${titleId}`);
-    const maxAttempts = 40; // Poll for up to 2 minutes (40 * 3s)
-    const pollInterval = 3000; // Poll every 3 seconds
-
-    if (attempt >= maxAttempts) {
-        console.error(`[Poll #${attempt + 1}] Polling timed out.`);
-        alert('Thumbnail generation is taking longer than expected. Please check back later.');
-        showLoading(false);
-        // Optionally load whatever is available
-        await loadThumbnails(titleId); 
-        return;
-    }
+    console.log(`[SSE] Entered stream mode for title ${titleId}`);
 
     try {
-        console.log(`[Poll #${attempt + 1}] Before API call to getPaintings`);
-        const startTime = Date.now();
-        // Log the API call details before making it
-        console.log(`[Poll #${attempt + 1}] Making API call to endpoint: /paintings/${titleId}`);
-        
+        // Initial load
         const response = await getPaintings(titleId);
-        
-        console.log(`[Poll #${attempt + 1}] API call completed in ${Date.now() - startTime}ms`);
-        // Use the paintings array instead of thumbnails
         const thumbnails = response.data.paintings || [];
-        console.log(`[Poll #${attempt + 1}] Fetched thumbnails:`, thumbnails);
-
-        // Filter only the thumbnails belonging to the current generation batch/title
-        // Assuming they are added sequentially and sorted ASC by creation time
-        const relevantThumbnails = thumbnails.filter(t => t.title_id === titleId); 
-
-        let completedCount = 0;
-        let processingCount = 0;
-        let pendingCount = 0;
-
-        // Render each thumbnail with its current status
-        // We need to determine the correct index for rendering.
-        // If loadTitle fetches initial thumbnails, we might need to map by ID or rely on the ASC order.
-        // Assuming the index corresponds to the position in the ASC sorted list for this title.
+        currentReferenceDataMap = response.data.referenceDataMap || {};
+        const relevantThumbnails = thumbnails
+            .filter(t => t.title_id === titleId)
+            .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
         relevantThumbnails.forEach((thumbnail, index) => {
-            // Ensure the container exists (it should have been created by generateServerThumbnails)
             const containerExists = document.getElementById(`thumb-${index}`);
-            if (containerExists) {
-                 renderThumbnail(thumbnail, index);
-            }
-
-            if (thumbnail.status === 'completed' || thumbnail.status === 'failed') {
-                completedCount++;
-            } else if (thumbnail.status === 'processing') {
-                processingCount++;
-            } else {
-                pendingCount++;
-            }
+            if (containerExists) renderThumbnail(thumbnail, index);
         });
 
-        const totalRelevant = relevantThumbnails.length;
-        console.log(`Status: ${completedCount} completed/failed, ${processingCount} processing, ${pendingCount} pending out of ${totalRelevant}`);
-
-        // Update progress UI (example)
-        ai1Status.textContent = 'Thumbnail ideas generated.';
-        ai1Progress.style.width = '100%';
-        // Base progress on completed thumbnails relative to the total number fetched so far for this title
-        // or use expectedQuantity if it's more reliable for the current batch
-        const progressPercentage = totalRelevant > 0 ? (completedCount / totalRelevant) * 100 : 0;
-        ai2Status.textContent = `Generating images... ${completedCount}/${totalRelevant} complete`;
-        ai2Progress.style.width = `${progressPercentage}%`;
-
-        // Check if all *relevant* thumbnails for this title are completed or failed
-        // This check might need refinement if multiple batches can run concurrently
-        if (completedCount === totalRelevant && totalRelevant >= expectedQuantity) {
-            console.log(`[Poll #${attempt + 1}] Condition met. Polling finished.`);
-            progressSection.style.display = 'none';
-            moreThumbnailsSection.style.display = 'block';
-            showLoading(false);
-        } else {
-            console.log(`[Poll #${attempt + 1}] Condition not met (${completedCount}/${totalRelevant} completed). Scheduling next poll.`);
-            // Not finished, poll again after interval
-            setTimeout(() => pollThumbnailStatus(titleId, expectedQuantity, attempt + 1), pollInterval);
+        // Set header running count based on server statuses
+        const runningCountInit = relevantThumbnails.filter(t => t.status === 'pending' || t.status === 'processing').length;
+        if (jobPill) {
+            jobPill.dataset.count = String(runningCountInit);
+            jobPill.textContent = `${runningCountInit} running`;
         }
+
+        // Subscribe to SSE stream for live updates
+        const es = streamPaintings(titleId);
+        if (connectionStatus) connectionStatus.classList.remove('online','offline');
+        if (connectionStatus) connectionStatus.classList.add('online');
+        es.onmessage = (e) => {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'jobStarted') {
+                    if (jobPill) {
+                        const current = parseInt(jobPill.dataset.count || '0', 10) + (msg.payload?.quantity || 0);
+                        jobPill.dataset.count = String(current);
+                        jobPill.textContent = `${current} running`;
+                    }
+                }
+                if (msg.type === 'paintingCreated') {
+                    ai2Status.textContent = 'Creating images...';
+                    if (jobPill) {
+                        const current = parseInt(jobPill.dataset.count || '0', 10) + 1;
+                        jobPill.dataset.count = String(current);
+                        jobPill.textContent = `${current} running`;
+                    }
+                }
+                if (msg.type === 'paintingUpdated') {
+                    // Reload thumbnails list to get ordering and reference map (could optimize)
+                    getPaintings(titleId).then(r => {
+                        const list = r.data.paintings || [];
+                        currentReferenceDataMap = r.data.referenceDataMap || {};
+                        const rel = list.filter(t => t.title_id === titleId).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                        rel.forEach((t, idx) => {
+                            const containerExists = document.getElementById(`thumb-${idx}`);
+                            if (containerExists) renderThumbnail(t, idx);
+                        });
+                        const completed = rel.filter(t => t.status === 'completed' || t.status === 'failed').length;
+                        const running = rel.filter(t => t.status === 'pending' || t.status === 'processing').length;
+                        ai2Status.textContent = `Creating images... ${completed}/${rel.length} complete`;
+                        ai2Progress.style.width = `${rel.length ? (completed / rel.length) * 100 : 0}%`;
+                        if (jobPill) {
+                            jobPill.dataset.count = String(running);
+                            jobPill.textContent = `${running} running`;
+                        }
+                        if (completed === rel.length && rel.length >= expectedQuantity) {
+                            progressSection.style.display = 'none';
+                            moreThumbnailsSection.style.display = 'block';
+                            showLoading(false);
+                            es.close();
+                            if (connectionStatus) connectionStatus.classList.remove('online');
+                            if (connectionStatus) connectionStatus.classList.add('offline');
+                            if (jobPill) {
+                                jobPill.dataset.count = '0';
+                                jobPill.textContent = '0 running';
+                            }
+                            showToast('Generation complete');
+                        }
+                    });
+                }
+                if (msg.type === 'jobCompleted' || msg.type === 'jobFailed') {
+                    if (jobPill) {
+                        const current = parseInt(jobPill.dataset.count || '0', 10);
+                        const dec = expectedQuantity || 0;
+                        const next = Math.max(0, current - dec);
+                        jobPill.dataset.count = String(next);
+                        jobPill.textContent = `${next} running`;
+                    }
+                }
+            } catch (err) {
+                console.warn('SSE message parse error', err);
+            }
+        };
+        es.onerror = () => {
+            console.warn('SSE connection error; falling back to single refresh');
+            // Fallback: one refresh
+            getPaintings(titleId).then(r => {
+                const list = r.data.paintings || [];
+                currentReferenceDataMap = r.data.referenceDataMap || {};
+                renderSavedThumbnails({ thumbnails: list });
+            }).finally(() => showLoading(false));
+            if (connectionStatus) connectionStatus.classList.remove('online');
+            if (connectionStatus) connectionStatus.classList.add('offline');
+            showToast('Reconnecting to updates failed');
+        };
     } catch (error) {
-        console.error(`[Poll #${attempt + 1}] Error during polling:`, error);
-        // Handle polling error (e.g., show message, maybe stop polling)
-        // If it's a transient network error, could retry a few times before failing
-        if (attempt < maxAttempts - 1) {
-             console.log(`[Poll #${attempt + 1}] Retrying poll after error.`);
-             setTimeout(() => pollThumbnailStatus(titleId, expectedQuantity, attempt + 1), pollInterval); // Retry on error
-        } else {
-             console.error(`[Poll #${attempt + 1}] Max retries reached after error.`);
-             alert('Failed to get thumbnail status updates after multiple attempts. Please check back later.');
-             showLoading(false);
-             // Load whatever is available on final error
-             await loadThumbnails(titleId);
-        }
+        console.error('[SSE] Error initializing stream:', error);
+        showLoading(false);
     }
 }
 
 // Initialize when the DOM is loaded
 document.addEventListener('DOMContentLoaded', init); 
+
+// Theme toggle
+document.addEventListener('DOMContentLoaded', () => {
+    const toggle = document.getElementById('theme-toggle');
+    if (!toggle) return;
+    const root = document.documentElement;
+    const saved = localStorage.getItem('theme');
+    if (saved === 'dark') root.classList.add('dark');
+    toggle.addEventListener('click', () => {
+        root.classList.toggle('dark');
+        localStorage.setItem('theme', root.classList.contains('dark') ? 'dark' : 'light');
+    });
+});
