@@ -107,10 +107,10 @@ export const deleteReference = async (id) => {
 };
 
 // Painting endpoints (renamed from Thumbnail)
-export const generateThumbnails = async (titleId, quantity = 5) => {
+export const generateThumbnails = async (titleId, quantity = 3, skipIdeas = true) => {
   const apiInstance = await ensureAPI();
   // Generation can take time (AI idea + image). Increase timeout for this call.
-  return apiInstance.post('/paintings/generate', { titleId, quantity }, { timeout: 120000 });
+  return apiInstance.post('/paintings/generate', { titleId, quantity, skipIdeas }, { timeout: 120000 });
 };
 
 export const getThumbnails = async (titleId) => {

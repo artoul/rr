@@ -11,8 +11,8 @@ async function generatePaintings(req, res) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
-  const { titleId, quantity = 5 } = req.body;
-  const MAX_PARALLEL = 5;
+  const { titleId, quantity = 3, skipIdeas } = req.body;
+  const IMAGE_MAX_PARALLEL = parseInt(process.env.IMAGES_MAX_PARALLEL || '5', 10);
   
   if (!titleId) {
     return res.status(400).json({ error: 'Title ID is required' });
@@ -85,65 +85,71 @@ async function generatePaintings(req, res) {
           sse.publish(titleId, { type: 'paintingCreated', payload: { titleId, ideaId, status: 'pending' } });
         }
 
-        // Now generate ideas sequentially into each stub to avoid duplicates
-        for (const ideaId of stubIdeaIds) {
-          const idea = await openRouterService.generateIdeas(
-            titleId,
-            title.title,
-            title.instructions,
-            [...prevIdeas, ...newIdeas],
-            ideaId
-          );
-          newIdeas.push(idea);
-        }
-
-        // Start image generation in parallel and await completion
-        const processIdeas = async () => {
-          const pendingIdeas = [...newIdeas];
-          const activePromises = [];
-
-          const maybeDone = (resolve) => {
-            if (pendingIdeas.length === 0 && activePromises.length === 0) {
-              resolve();
-            }
-          };
-
-          return new Promise((resolve) => {
-            const startNextIdea = () => {
-              if (pendingIdeas.length === 0) {
-                maybeDone(resolve);
-                return;
-              }
-              const idea = pendingIdeas.shift();
-              const promise = openAIService.generateImage(idea.id, idea.fullPrompt, references)
-                .then(result => {
-                  sse.publish(titleId, { type: 'paintingUpdated', payload: { ideaId: idea.id, status: result.status, image_url: result.imageUrl } });
-                  jobs.incrementCompleted(job.id);
-                })
-                .catch(error => {
-                  console.error(`Error generating image for idea ${idea.id}:`, error);
-                  sse.publish(titleId, { type: 'paintingUpdated', payload: { ideaId: idea.id, status: 'failed', error: String(error.message || error) } });
-                  jobs.incrementFailed(job.id);
-                })
-                .finally(() => {
-                  const index = activePromises.indexOf(promise);
-                  if (index !== -1) activePromises.splice(index, 1);
-                  startNextIdea();
-                  maybeDone(resolve);
-                });
-              activePromises.push(promise);
-            };
-
-            const initialBatch = Math.min(MAX_PARALLEL, pendingIdeas.length);
-            for (let i = 0; i < initialBatch; i++) {
-              startNextIdea();
-            }
-            // Edge case: quantity 0
-            maybeDone(resolve);
-          });
+        // Image generation queue with concurrency
+        const pendingImageIdeas = [];
+        const activeImagePromises = [];
+        const startNextImage = () => {
+          while (pendingImageIdeas.length > 0 && activeImagePromises.length < IMAGE_MAX_PARALLEL) {
+            const idea = pendingImageIdeas.shift();
+            const p = openAIService.generateImage(idea.id, idea.fullPrompt, references)
+              .then(result => {
+                sse.publish(titleId, { type: 'paintingUpdated', payload: { ideaId: idea.id, status: result.status, image_url: result.imageUrl } });
+                jobs.incrementCompleted(job.id);
+              })
+              .catch(error => {
+                console.error(`Error generating image for idea ${idea.id}:`, error);
+                sse.publish(titleId, { type: 'paintingUpdated', payload: { ideaId: idea.id, status: 'failed', error: String(error.message || error) } });
+                jobs.incrementFailed(job.id);
+              })
+              .finally(() => {
+                const index = activeImagePromises.indexOf(p);
+                if (index !== -1) activeImagePromises.splice(index, 1);
+                startNextImage();
+              });
+            activeImagePromises.push(p);
+          }
         };
 
-        await processIdeas();
+        // If skipping idea generation, derive prompts directly from title and instructions
+        if (skipIdeas === true || String(process.env.SKIP_IDEA_GENERATION).toLowerCase() === 'true') {
+          for (const ideaId of stubIdeaIds) {
+            const derivedSummary = title.title;
+            const derivedFullPrompt = title.instructions && title.instructions.trim().length > 0
+              ? `${title.title}. ${title.instructions}`
+              : `${title.title}`;
+            await pool.execute(
+              'UPDATE ideas SET summary = ?, full_prompt = ? WHERE id = ?',
+              [derivedSummary, derivedFullPrompt, ideaId]
+            );
+            const idea = { id: ideaId, titleId, summary: derivedSummary, fullPrompt: derivedFullPrompt };
+            newIdeas.push(idea);
+            pendingImageIdeas.push(idea);
+            startNextImage();
+          }
+        } else {
+          // Now generate ideas sequentially and immediately start images (pipeline)
+          for (const ideaId of stubIdeaIds) {
+            const idea = await openRouterService.generateIdeas(
+              titleId,
+              title.title,
+              title.instructions,
+              [...prevIdeas, ...newIdeas],
+              ideaId
+            );
+            newIdeas.push(idea);
+            pendingImageIdeas.push(idea);
+            startNextImage();
+          }
+        }
+
+        // Wait until all images are finished
+        await new Promise((resolve) => {
+          const checkDone = () => {
+            if (pendingImageIdeas.length === 0 && activeImagePromises.length === 0) resolve();
+            else setTimeout(checkDone, 50);
+          };
+          checkDone();
+        });
         jobs.completeJob(job.id);
         sse.publish(titleId, { type: 'jobCompleted', payload: { titleId, jobId: job.id } });
       } catch (err) {

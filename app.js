@@ -201,10 +201,7 @@ const moreThumbnailsSection = document.getElementById('more-thumbnails-section')
 const thumbnailsGrid = document.getElementById('thumbnails-grid');
 const thumbnailsEmptyState = document.getElementById('thumbnails-empty-state');
 const progressSection = document.getElementById('progress-section');
-const ai1Progress = document.getElementById('ai1-progress');
-const ai2Progress = document.getElementById('ai2-progress');
-const ai1Status = document.getElementById('ai1-status');
-const ai2Status = document.getElementById('ai2-status');
+const progressStatus = document.getElementById('progress-status');
 const newTitleBtn = document.getElementById('new-title-btn');
 const globalReferenceToggle = document.getElementById('global-reference-toggle');
 const globalReferencesSection = document.getElementById('global-references');
@@ -442,7 +439,7 @@ function setupEventListeners() {
         
         try {
             const instructions = customInstructions.value.trim();
-            const quantity = parseInt(quantitySelect.value) || 5;
+            const quantity = parseInt(quantitySelect.value) || 3;
             
             console.log("Creating/updating title:", { title, instructions });
             
@@ -472,19 +469,20 @@ function setupEventListeners() {
                 }
             }
             
-            // Prepare UI: show progress and create placeholders
+            // Prepare UI: show progress and append placeholders after existing items
             progressSection.style.display = 'block';
             thumbnailsEmptyState.style.display = 'none';
-            thumbnailsGrid.innerHTML = '';
+            const existingCount = thumbnailsGrid.querySelectorAll('.thumbnail-item').length;
             for (let i = 0; i < quantity; i++) {
+                const idx = existingCount + i;
                 const thumbContainer = document.createElement('div');
                 thumbContainer.className = 'thumbnail-item';
-                thumbContainer.id = `thumb-${i}`;
+                thumbContainer.id = `thumb-${idx}`;
                 const loadingThumb = document.createElement('div');
                 loadingThumb.className = 'loading-thumbnail';
                 const stage = document.createElement('div');
                 stage.className = 'thumbnail-stage';
-                stage.textContent = 'Creating prompt...';
+                stage.textContent = 'Generating image...';
                 const pbar = document.createElement('div');
                 pbar.className = 'progress-bar';
                 const pfill = document.createElement('div');
@@ -495,6 +493,10 @@ function setupEventListeners() {
                 loadingThumb.appendChild(pbar);
                 thumbContainer.appendChild(loadingThumb);
                 thumbnailsGrid.appendChild(thumbContainer);
+            }
+            // Scroll to the thumbnails area so the user sees generation progress
+            if (thumbnailsGrid && typeof thumbnailsGrid.scrollIntoView === 'function') {
+                thumbnailsGrid.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
 
             // Header pill is derived from server state only; no optimistic bump
@@ -542,23 +544,25 @@ function setupEventListeners() {
         }
     });
     
-    // More Thumbnails Button
-    moreThumbnailsBtn.addEventListener('click', async () => {
-        if (!currentTitle) return;
-        
-        try {
-            const quantity = parseInt(quantitySelect.value) || 3;
+    // More Thumbnails Button (optional section may be commented out)
+    if (moreThumbnailsBtn) {
+        moreThumbnailsBtn.addEventListener('click', async () => {
+            if (!currentTitle) return;
             
-            // Enqueue more thumbnails (returns immediately)
-            await generatePaintings(currentTitle.id, quantity);
-            
-            // Start/renew SSE stream to reflect new items progressively
-            pollThumbnailStatus(currentTitle.id, quantity);
-        } catch (error) {
-            console.error('Error generating more thumbnails:', error);
-            alert('Failed to generate additional thumbnails. Please try again.');
-        }
-    });
+            try {
+                const quantity = parseInt(quantitySelect.value) || 3;
+                
+                // Enqueue more thumbnails (returns immediately)
+                await generatePaintings(currentTitle.id, quantity);
+                
+                // Start/renew SSE stream to reflect new items progressively
+                pollThumbnailStatus(currentTitle.id, quantity);
+            } catch (error) {
+                console.error('Error generating more thumbnails:', error);
+                alert('Failed to generate additional thumbnails. Please try again.');
+            }
+        });
+    }
     
     // Toggle reference type
     globalReferenceToggle.addEventListener('change', () => {
@@ -876,38 +880,30 @@ async function generateServerThumbnails(titleObj, references, quantity, isAdditi
         renderThumbnail(thumbnail, thumbnail.index);
         completedThumbnails.push(thumbnail);
         
-        // Update the AI2 status
-        ai2Status.textContent = `Creating images... ${completedThumbnails.length}/${quantity} complete`;
-        ai2Progress.style.width = `${(completedThumbnails.length / quantity) * 100}%`;
+        // Update simplified progress
+        if (progressStatus) progressStatus.textContent = `Generating images... ${completedThumbnails.length}/${quantity} complete`;
     };
     
     try {
-        // Simulate AI 1 (concept generation) - sequential
-        ai1Status.textContent = 'Generating painting ideas...';
-        simulateProgress(ai1Progress, null, null, 'Painting concepts ready!', 3000, async () => {
-            // After AI 1 completes, start AI 2 (image generation) - parallel
-            ai2Status.textContent = 'Creating images... 0/' + quantity + ' complete';
-            ai2Progress.style.width = '0%';
-            
-            // Get AI-generated thumbnails from server (now in parallel)
-            const newThumbnails = await ServerAPI.generateThumbnails(titleObj, references, quantity, startIndex);
-            
-            // After all thumbnails are generated
-            progressSection.style.display = 'none';
-            moreThumbnailsSection.style.display = 'block';
-            
-            // Save the generated thumbnails
-            if (isAdditional) {
-                titleObj.thumbnails = [...titleObj.thumbnails, ...newThumbnails];
-            } else {
-                titleObj.thumbnails = newThumbnails;
-            }
-            
-            await saveData();
-            
-            // Clear the callback
-            thumbnailReady = null;
-        });
+        // Directly start image generation (legacy simulated path)
+        if (progressStatus) progressStatus.textContent = 'Generating images...';
+        const newThumbnails = await ServerAPI.generateThumbnails(titleObj, references, quantity, startIndex);
+        
+        // After all thumbnails are generated
+        progressSection.style.display = 'none';
+        if (moreThumbnailsSection) moreThumbnailsSection.style.display = 'block';
+        
+        // Save the generated thumbnails
+        if (isAdditional) {
+            titleObj.thumbnails = [...titleObj.thumbnails, ...newThumbnails];
+        } else {
+            titleObj.thumbnails = newThumbnails;
+        }
+        
+        await saveData();
+        
+        // Clear the callback
+        thumbnailReady = null;
     } catch (error) {
         console.error('Error generating thumbnails:', error);
         alert('Failed to generate paintings. Please try again.');
@@ -1190,11 +1186,48 @@ function renderTitlesList() {
             titleItem.classList.add('active');
         }
         
-        titleItem.textContent = title.title;
-        titleItem.addEventListener('click', () => {
+        // Layout container to hold text and delete button
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.justifyContent = 'space-between';
+        
+        const titleText = document.createElement('span');
+        titleText.textContent = title.title;
+        titleText.style.flex = '1';
+        titleText.style.cursor = 'pointer';
+        titleText.addEventListener('click', () => {
             loadTitle(title);
         });
         
+        const delBtn = document.createElement('button');
+        delBtn.textContent = 'Delete';
+        delBtn.className = 'btn small-btn bg-red-600 hover:bg-red-700 text-white rounded-md';
+        delBtn.style.marginLeft = '8px';
+        delBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const confirmed = confirm('Delete this title and all its paintings?');
+            if (!confirmed) return;
+            try {
+                await deleteTitle(title.id);
+                // If we deleted the currently loaded title, clear the main content
+                if (currentTitle && currentTitle.id === title.id) {
+                    clearMainContent();
+                }
+                // Refresh titles list
+                const titlesResponse = await getTitles();
+                titles = titlesResponse.data.titles;
+                renderTitlesList();
+                showToast('Title deleted');
+            } catch (err) {
+                console.error('Delete title failed:', err);
+                alert(err?.response?.data?.error || 'Failed to delete title.');
+            }
+        });
+        
+        row.appendChild(titleText);
+        row.appendChild(delBtn);
+        titleItem.appendChild(row);
         titleList.appendChild(titleItem);
     });
 }
@@ -1275,7 +1308,9 @@ async function loadTitle(titleItem) {
         });
         
         // Show more thumbnails button if thumbnails exist
-        moreThumbnailsSection.style.display = currentTitle.thumbnails && currentTitle.thumbnails.length > 0 ? 'block' : 'none';
+        if (moreThumbnailsSection) {
+            moreThumbnailsSection.style.display = currentTitle.thumbnails && currentTitle.thumbnails.length > 0 ? 'block' : 'none';
+        }
     } catch (error) {
         console.error('Error loading title:', error);
         alert(`Failed to load title data: ${error.message}. Please try again.`);
@@ -1286,8 +1321,7 @@ async function loadTitle(titleItem) {
 
 // Render saved thumbnails for a title
 function renderSavedThumbnails(title) {
-    thumbnailsGrid.innerHTML = '';
-    
+    // Do not wipe existing nodes; append/update to preserve prior items
     if (!title || !title.thumbnails || !Array.isArray(title.thumbnails) || title.thumbnails.length === 0) {
         thumbnailsEmptyState.style.display = 'block';
         return;
@@ -1306,11 +1340,14 @@ function renderSavedThumbnails(title) {
     
     validThumbnails.forEach((thumbnail, index) => {
         try {
-            const thumbContainer = document.createElement('div');
-            thumbContainer.className = 'thumbnail-item';
-            thumbContainer.id = `thumb-${index}`;
-            thumbnailsGrid.appendChild(thumbContainer);
-            
+            const id = `thumb-${index}`;
+            let thumbContainer = document.getElementById(id);
+            if (!thumbContainer) {
+                thumbContainer = document.createElement('div');
+                thumbContainer.className = 'thumbnail-item';
+                thumbContainer.id = id;
+                thumbnailsGrid.appendChild(thumbContainer);
+            }
             renderThumbnail(thumbnail, index);
         } catch (error) {
             console.error(`Error rendering thumbnail at index ${index}:`, error);
@@ -1323,10 +1360,10 @@ function clearMainContent() {
     currentTitle = null;
     titleInput.value = '';
     customInstructions.value = '';
-    quantitySelect.value = '5';
+    quantitySelect.value = '3';
     thumbnailsGrid.innerHTML = '';
     thumbnailsEmptyState.style.display = 'block';
-    moreThumbnailsSection.style.display = 'none';
+    if (moreThumbnailsSection) moreThumbnailsSection.style.display = 'none';
     
     // Update reference images sections
     globalReferenceToggle.checked = true;
@@ -1426,29 +1463,41 @@ async function pollThumbnailStatus(titleId, expectedQuantity, attempt = 0) {
                     // no-op: rely on recompute in paintingUpdated
                 }
                 if (msg.type === 'paintingCreated') {
-                    ai2Status.textContent = 'Creating images...';
+                    if (progressStatus) progressStatus.textContent = 'Generating images...';
                 }
                 if (msg.type === 'paintingUpdated') {
                     // Reload thumbnails list to get ordering and reference map (could optimize)
                     getPaintings(titleId).then(r => {
                         const list = r.data.paintings || [];
                         currentReferenceDataMap = r.data.referenceDataMap || {};
-                        const rel = list.filter(t => t.title_id === titleId).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                        const rel = list
+                          .filter(t => t.title_id === titleId)
+                          .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                        // Ensure we have containers; append new ones if needed
+                        let existingCount = thumbnailsGrid.querySelectorAll('.thumbnail-item').length;
                         rel.forEach((t, idx) => {
-                            const containerExists = document.getElementById(`thumb-${idx}`);
-                            if (containerExists) renderThumbnail(t, idx);
+                            const id = `thumb-${idx}`;
+                            let container = document.getElementById(id);
+                            if (!container) {
+                                // create missing container at the end
+                                container = document.createElement('div');
+                                container.className = 'thumbnail-item';
+                                container.id = id;
+                                thumbnailsGrid.appendChild(container);
+                                existingCount += 1;
+                            }
+                            renderThumbnail(t, idx);
                         });
                         const completed = rel.filter(t => t.status === 'completed' || t.status === 'failed').length;
                         const running = rel.filter(t => t.status === 'processing').length; // only actively generating
-                        ai2Status.textContent = `Creating images... ${completed}/${rel.length} complete`;
-                        ai2Progress.style.width = `${rel.length ? (completed / rel.length) * 100 : 0}%`;
+                        if (progressStatus) progressStatus.textContent = `Generating images... ${completed}/${rel.length} complete`;
                         if (jobPill) {
                             jobPill.dataset.count = String(running);
                             jobPill.textContent = `${running} running`;
                         }
                         if (completed === rel.length && rel.length >= expectedQuantity) {
                             progressSection.style.display = 'none';
-                            moreThumbnailsSection.style.display = 'block';
+                            if (moreThumbnailsSection) moreThumbnailsSection.style.display = 'block';
                             showLoading(false);
                             es.close();
                             if (connectionStatus) connectionStatus.classList.remove('online');

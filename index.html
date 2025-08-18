@@ -149,24 +149,15 @@
                 </div>
                 <div class="input-group">
                     <label for="quantity-select">Number of Paintings:</label>
-                    <input type="number" id="quantity-select" min="1" max="10" value="5" class="border rounded-md px-3 py-2 w-full">
+                    <input type="number" id="quantity-select" min="1" max="5" value="3" class="border rounded-md px-3 py-2 w-full">
                 </div>
                 <button id="generate-btn" class="btn primary-btn bg-blue-600 hover:bg-blue-700 text-white rounded-md">Generate Paintings</button>
             </div>
 
-            <!-- Generation Progress -->
+            <!-- Generation Progress (simplified) -->
             <div class="progress-section" id="progress-section" style="display: none;">
                 <div class="progress-item">
-                    <p>AI 1: <span id="ai1-status">Generating painting ideas...</span></p>
-                    <div class="progress-bar">
-                        <div class="progress-fill" id="ai1-progress"></div>
-                    </div>
-                </div>
-                <div class="progress-item">
-                    <p>AI 2: <span id="ai2-status">Waiting for concepts...</span></p>
-                    <div class="progress-bar">
-                        <div class="progress-fill" id="ai2-progress"></div>
-                    </div>
+                    <p id="progress-status">Generating images...</p>
                 </div>
             </div>
 
@@ -177,9 +168,9 @@
                     <!-- Paintings will be displayed here -->
                     <div class="empty-state" id="thumbnails-empty-state">No paintings generated yet.</div>
                 </div>
-                <div class="more-thumbnails-section" id="more-thumbnails-section" style="display: none;">
+                <!-- <div class="more-thumbnails-section" id="more-thumbnails-section" style="display: none;">
                     <button id="more-thumbnails-btn" class="btn primary-btn bg-blue-600 hover:bg-blue-700 text-white rounded-md">Generate More Paintings</button>
-                </div>
+                </div> -->
             </div>
         </div>
     </div>
