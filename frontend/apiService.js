@@ -4,13 +4,11 @@ import axios from 'https://cdn.jsdelivr.net/npm/axios@1.3.5/+esm';
 let API_URL = '';
 let api = null;
 
-// Fetch server configuration and initialize the API
+// Initialize the API with the current origin (since frontend and backend are on same port)
 const initAPI = async () => {
   try {
-    // Use the current origin to get the config (for local development, we might need to adjust this)
-    const configResponse = await axios.get('/api/config');
-    const { serverIP, apiPort } = configResponse.data;
-    API_URL = `http://${serverIP}:${apiPort}/api`;
+    // Since frontend and backend are on the same port, use relative URLs
+    API_URL = '/api';
     
     // Create axios instance with auth token
     api = axios.create({
@@ -32,30 +30,7 @@ const initAPI = async () => {
     
     return true;
   } catch (error) {
-    console.error('Failed to fetch server configuration, using default', error);
-    
-    // Fallback to using the current hostname instead of hardcoded IP
-    const currentHostname = window.location.hostname;
-    API_URL = `http://${currentHostname}:3000/api`;
-    
-    // Create axios instance with auth token
-    api = axios.create({
-      baseURL: API_URL,
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    });
-
-    // Add auth token to requests if available
-    api.interceptors.request.use(config => {
-      const token = localStorage.getItem('token');
-      if (token) {
-        config.headers.Authorization = `Bearer ${token}`;
-      }
-      return config;
-    });
-    
+    console.error('Failed to initialize API:', error);
     return false;
   }
 };
@@ -132,14 +107,23 @@ export const deleteReference = async (id) => {
 };
 
 // Painting endpoints (renamed from Thumbnail)
-export const generateThumbnails = async (titleId, quantity = 5) => {
+export const generateThumbnails = async (titleId, quantity = 3, skipIdeas = true) => {
   const apiInstance = await ensureAPI();
-  return apiInstance.post('/paintings/generate', { titleId, quantity });
+  // Generation can take time (AI idea + image). Increase timeout for this call.
+  return apiInstance.post('/paintings/generate', { titleId, quantity, skipIdeas }, { timeout: 120000 });
 };
 
 export const getThumbnails = async (titleId) => {
   const apiInstance = await ensureAPI();
   return apiInstance.get(`/paintings/${titleId}`);
+};
+
+// SSE helper to subscribe to painting updates for a title
+export const streamPaintings = (titleId) => {
+  const token = localStorage.getItem('token');
+  const url = `${API_URL}/paintings/stream/${titleId}?token=${encodeURIComponent(token || '')}`;
+  // Use absolute path when API_URL is relative
+  return new EventSource(url);
 };
 
 // Initialize API when this module is imported

@@ -6,7 +6,8 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 // Function to generate painting ideas using OpenRouter with function calling
-async function generateIdeas(titleId, titleText, instructions, previousIdeas = []) {
+// If existingIdeaId is provided, updates that idea row instead of inserting a new one
+async function generateIdeas(titleId, titleText, instructions, previousIdeas = [], existingIdeaId = null) {
   try {
     if (!titleId) {
       throw new Error('Title ID is required for idea generation');
@@ -71,21 +72,34 @@ async function generateIdeas(titleId, titleText, instructions, previousIdeas = [
       throw new Error('Incomplete idea data received from AI');
     }
 
-    // Save to database
-    const params = [titleId, ideaData.summary, ideaData.fullPrompt];
-    // Validate parameters
-    if (params.some(p => p === undefined)) {
-      console.error('Attempted to execute query with undefined parameter:', { params });
-      throw new Error('Invalid query parameter detected');
+    let ideaId = existingIdeaId;
+    if (existingIdeaId) {
+      // Update existing idea
+      const updateParams = [ideaData.summary, ideaData.fullPrompt, existingIdeaId];
+      if (updateParams.some(p => p === undefined)) {
+        console.error('Attempted to execute query with undefined parameter:', { updateParams });
+        throw new Error('Invalid query parameter detected');
+      }
+      await pool.execute(
+        'UPDATE ideas SET summary = ?, full_prompt = ? WHERE id = ?',
+        updateParams
+      );
+    } else {
+      // Insert new idea
+      const insertParams = [titleId, ideaData.summary, ideaData.fullPrompt];
+      if (insertParams.some(p => p === undefined)) {
+        console.error('Attempted to execute query with undefined parameter:', { insertParams });
+        throw new Error('Invalid query parameter detected');
+      }
+      const [result] = await pool.execute(
+        'INSERT INTO ideas (title_id, summary, full_prompt) VALUES (?, ?, ?)',
+        insertParams
+      );
+      ideaId = result.insertId;
     }
-    
-    const [result] = await pool.execute(
-      'INSERT INTO ideas (title_id, summary, full_prompt) VALUES (?, ?, ?)',
-      params
-    );
 
     const idea = {
-      id: result.insertId,
+      id: ideaId,
       titleId,
       summary: ideaData.summary,
       fullPrompt: ideaData.fullPrompt

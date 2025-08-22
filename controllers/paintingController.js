@@ -1,129 +1,177 @@
 const { pool } = require('../database');
 const openRouterService = require('../services/openRouterService');
 const openAIService = require('../services/openAIService');
+const sse = require('../services/sse');
+const jobs = require('../services/jobQueue');
 
-// Generate painting ideas (parallel processing)
+// Generate painting ideas (enqueue and process fully in background)
 async function generatePaintings(req, res) {
   if (!req.user || !req.user.id) {
     console.error('User not authenticated properly');
     return res.status(401).json({ error: 'Authentication required' });
   }
 
-  const { titleId, quantity = 5 } = req.body;
-  const MAX_PARALLEL = 5;
+  const { titleId, quantity = 3, skipIdeas } = req.body;
+  const IMAGE_MAX_PARALLEL = parseInt(process.env.IMAGES_MAX_PARALLEL || '5', 10);
   
   if (!titleId) {
     return res.status(400).json({ error: 'Title ID is required' });
   }
-  
+
   try {
-    // Get title info
-    const titleParams = [titleId];
-    if (titleParams.some(p => p === undefined)) {
-      console.error('Attempted to execute query with undefined parameter:', { titleParams });
-      return res.status(500).json({ error: 'Internal server error: Invalid query parameter detected' });
-    }
-    
-    const [titleRows] = await pool.execute(
-      'SELECT id, title, instructions FROM titles WHERE id = ?',
-      titleParams
-    );
-    
-    if (titleRows.length === 0) {
-      return res.status(404).json({ error: 'Title not found' });
-    }
-    
-    const title = titleRows[0];
-    
-    // Get reference images
-    const refParams = [titleId, req.user.id];
-    if (refParams.some(p => p === undefined)) {
-      console.error('Attempted to execute query with undefined parameter:', { refParams });
-      return res.status(500).json({ error: 'Internal server error: Invalid query parameter detected' });
-    }
-    
-    const [refRows] = await pool.execute(
-      'SELECT id, image_data FROM references2 WHERE title_id = ? OR (user_id = ? AND is_global = 1)',
-      refParams
-    );
-    
-    const references = refRows.map(row => ({ id: row.id, image_data: row.image_data }));
-    
-    // Get previous ideas for this title to avoid duplication
-    const prevParams = [titleId];
-    if (prevParams.some(p => p === undefined)) {
-      console.error('Attempted to execute query with undefined parameter:', { prevParams });
-      return res.status(500).json({ error: 'Internal server error: Invalid query parameter detected' });
-    }
-    
-    const [prevIdeas] = await pool.execute(
-      'SELECT id, summary FROM ideas WHERE title_id = ? ORDER BY created_at DESC',
-      prevParams
-    );
-    
-    // Generate ideas - first step (sequential)
-    const newIdeas = [];
-    for (let i = 0; i < quantity; i++) {
-      const idea = await openRouterService.generateIdeas(
-        titleId, 
-        title.title, 
-        title.instructions,
-        [...prevIdeas, ...newIdeas] // Include previously generated ideas to avoid repetition
-      );
-      newIdeas.push(idea);
-      
-      // Create painting entry in processing state
-      const paintingParams = [titleId, idea.id, 'pending'];
-      if (paintingParams.some(p => p === undefined)) {
-        console.error('Attempted to execute query with undefined parameter:', { paintingParams });
-        return res.status(500).json({ error: 'Internal server error: Invalid query parameter detected' });
+    // Create a job and return immediately
+    const job = jobs.createJob({ titleId, quantity });
+    // Notify header UI that a job has started (client may aggregate by title)
+    sse.publish(titleId, { type: 'jobStarted', payload: { titleId, quantity, jobId: job.id } });
+    res.status(202).json({ message: `Enqueued generation of ${quantity} paintings`, jobId: job.id });
+
+    // Background worker
+    (async () => {
+      try {
+        jobs.startJob(job.id);
+
+        // Get title info
+        const titleParams = [titleId];
+        if (titleParams.some(p => p === undefined)) {
+          console.error('Attempted to execute query with undefined parameter:', { titleParams });
+          throw new Error('Invalid query parameter detected');
+        }
+        const [titleRows] = await pool.execute(
+          'SELECT id, title, instructions FROM titles WHERE id = ?',
+          titleParams
+        );
+        if (titleRows.length === 0) {
+          throw new Error('Title not found');
+        }
+        const title = titleRows[0];
+
+        // Get reference images
+        const refParams = [titleId, req.user.id];
+        if (refParams.some(p => p === undefined)) {
+          console.error('Attempted to execute query with undefined parameter:', { refParams });
+          throw new Error('Invalid query parameter detected');
+        }
+        const [refRows] = await pool.execute(
+          'SELECT id, image_data FROM references2 WHERE title_id = ? OR (user_id = ? AND is_global = 1)',
+          refParams
+        );
+        const references = refRows.map(row => ({ id: row.id, image_data: row.image_data }));
+
+        // Get previous ideas for this title to avoid duplication
+        const prevParams = [titleId];
+        if (prevParams.some(p => p === undefined)) {
+          console.error('Attempted to execute query with undefined parameter:', { prevParams });
+          throw new Error('Invalid query parameter detected');
+        }
+        const [prevIdeas] = await pool.execute(
+          'SELECT id, summary FROM ideas WHERE title_id = ? ORDER BY created_at DESC',
+          prevParams
+        );
+
+        // Pre-create idea stubs and paintings so placeholders are stable
+        const newIdeas = [];
+        const stubIdeaIds = [];
+        for (let i = 0; i < quantity; i++) {
+          const [stubRes] = await pool.execute(
+            'INSERT INTO ideas (title_id, summary, full_prompt) VALUES (?, ?, ?)',
+            [titleId, '', '']
+          );
+          const ideaId = stubRes.insertId;
+          stubIdeaIds.push(ideaId);
+          await pool.execute(
+            'INSERT INTO paintings (title_id, idea_id, status) VALUES (?, ?, ?)',
+            [titleId, ideaId, 'pending']
+          );
+          sse.publish(titleId, { type: 'paintingCreated', payload: { titleId, ideaId, status: 'pending' } });
+        }
+
+        // Image generation queue with concurrency
+        const pendingImageIdeas = [];
+        const activeImagePromises = [];
+        const startNextImage = () => {
+          while (pendingImageIdeas.length > 0 && activeImagePromises.length < IMAGE_MAX_PARALLEL) {
+            const idea = pendingImageIdeas.shift();
+            const p = openAIService.generateImage(idea.id, idea.fullPrompt, references)
+              .then(result => {
+                sse.publish(titleId, { type: 'paintingUpdated', payload: { ideaId: idea.id, status: result.status, image_url: result.imageUrl } });
+                jobs.incrementCompleted(job.id);
+              })
+              .catch(error => {
+                console.error(`Error generating image for idea ${idea.id}:`, error);
+                sse.publish(titleId, { type: 'paintingUpdated', payload: { ideaId: idea.id, status: 'failed', error: String(error.message || error) } });
+                jobs.incrementFailed(job.id);
+              })
+              .finally(() => {
+                const index = activeImagePromises.indexOf(p);
+                if (index !== -1) activeImagePromises.splice(index, 1);
+                startNextImage();
+              });
+            activeImagePromises.push(p);
+          }
+        };
+
+        // If skipping idea generation, derive prompts directly from title and instructions
+        if (skipIdeas === true || String(process.env.SKIP_IDEA_GENERATION).toLowerCase() === 'true') {
+          const styleVariations = [
+            'Bold complementary colors, high contrast, dramatic lighting.',
+            'Muted pastel palette, soft gradients, minimalistic composition.',
+            'Abstract geometric forms, asymmetry, emphasis on negative space.',
+            'Textured brushstroke effect, painterly style, warm tones.',
+            'Futuristic neon palette, cyberpunk mood, high saturation.',
+            'Monochrome noir, strong chiaroscuro, cinematic framing.',
+            'Organic shapes, nature-inspired patterns, earthy tones.',
+            'Surreal composition, unexpected scale, dreamlike atmosphere.'
+          ];
+          for (const ideaId of stubIdeaIds) {
+            const derivedSummary = title.title;
+            const variation = styleVariations[Math.floor(Math.random() * styleVariations.length)];
+            const basePrompt = title.instructions && title.instructions.trim().length > 0
+              ? `${title.title}. ${title.instructions}`
+              : `${title.title}`;
+            const derivedFullPrompt = `${basePrompt}\nStyle variation: ${variation}`;
+            await pool.execute(
+              'UPDATE ideas SET summary = ?, full_prompt = ? WHERE id = ?',
+              [derivedSummary, derivedFullPrompt, ideaId]
+            );
+            const idea = { id: ideaId, titleId, summary: derivedSummary, fullPrompt: derivedFullPrompt };
+            newIdeas.push(idea);
+            pendingImageIdeas.push(idea);
+            startNextImage();
+          }
+        } else {
+          // Now generate ideas sequentially and immediately start images (pipeline)
+          for (const ideaId of stubIdeaIds) {
+            const idea = await openRouterService.generateIdeas(
+              titleId,
+              title.title,
+              title.instructions,
+              [...prevIdeas, ...newIdeas],
+              ideaId
+            );
+            newIdeas.push(idea);
+            pendingImageIdeas.push(idea);
+            startNextImage();
+          }
+        }
+
+        // Wait until all images are finished
+        await new Promise((resolve) => {
+          const checkDone = () => {
+            if (pendingImageIdeas.length === 0 && activeImagePromises.length === 0) resolve();
+            else setTimeout(checkDone, 50);
+          };
+          checkDone();
+        });
+        jobs.completeJob(job.id);
+        sse.publish(titleId, { type: 'jobCompleted', payload: { titleId, jobId: job.id } });
+      } catch (err) {
+        jobs.failJob(job.id, err);
+        sse.publish(titleId, { type: 'jobFailed', payload: { titleId, jobId: job.id, error: String(err?.message || err) } });
       }
-      
-      await pool.execute(
-        'INSERT INTO paintings (title_id, idea_id, status) VALUES (?, ?, ?)',
-        paintingParams
-      );
-    }
-    
-    // Start image generation in parallel (respecting MAX_PARALLEL limit)
-    const processIdeas = async () => {
-      const pendingIdeas = [...newIdeas];
-      const activePromises = [];
-      
-      const startNextIdea = () => {
-        if (pendingIdeas.length === 0) return;
-        
-        const idea = pendingIdeas.shift();
-        const promise = openAIService.generateImage(idea.id, idea.fullPrompt, references)
-          .catch(error => console.error(`Error generating image for idea ${idea.id}:`, error))
-          .finally(() => {
-            // When one finishes, start another if available
-            const index = activePromises.indexOf(promise);
-            if (index !== -1) activePromises.splice(index, 1);
-            startNextIdea();
-          });
-        
-        activePromises.push(promise);
-      };
-      
-      // Start initial batch
-      const initialBatch = Math.min(MAX_PARALLEL, pendingIdeas.length);
-      for (let i = 0; i < initialBatch; i++) {
-        startNextIdea();
-      }
-    };
-    
-    // Start processing in background
-    processIdeas();
-    
-    // Return immediately with the generated ideas
-    res.status(200).json({
-      message: `Started generating ${quantity} paintings`,
-      ideas: newIdeas
-    });
+    })();
   } catch (error) {
-    console.error('Error in generatePaintings:', error);
-    res.status(500).json({ error: 'Failed to generate paintings' });
+    console.error('Error in generatePaintings (enqueue):', error);
+    res.status(500).json({ error: 'Failed to enqueue generation' });
   }
 }
 
@@ -281,7 +329,57 @@ async function getPaintings(req, res) {
   }
 }
 
+// SSE stream endpoint
+async function streamPaintings(req, res) {
+  if (!req.user || !req.user.id) {
+    console.error('User not authenticated properly');
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const { titleId } = req.params;
+  if (!titleId) {
+    return res.status(400).json({ error: 'Title ID is required' });
+  }
+
+  // Headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders && res.flushHeaders();
+
+  // Subscribe and send heartbeat
+  sse.subscribe(titleId, res);
+
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch (_) {}
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sse.unsubscribe(titleId, res);
+    res.end();
+  });
+}
+
+// Job status endpoint
+async function getJobStatus(req, res) {
+  if (!req.user || !req.user.id) {
+    console.error('User not authenticated properly');
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const { jobId } = req.params;
+  if (!jobId) {
+    return res.status(400).json({ error: 'Job ID is required' });
+  }
+  const job = require('../services/jobQueue').getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.status(200).json({ job });
+}
+
 module.exports = {
   generatePaintings,
-  getPaintings
+  getPaintings,
+  streamPaintings,
+  getJobStatus
 }; 

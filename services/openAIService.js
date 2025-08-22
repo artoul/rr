@@ -3,10 +3,26 @@ const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
 const { pool } = require('../database');
+const sse = require('../services/sse');
+const http = require('http');
+const https = require('https');
 require('dotenv').config();
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const UPLOADS_DIR = path.join(__dirname, '../uploads');
+
+// Tunables
+const HTTP_TIMEOUT = parseInt(process.env.IMAGE_API_TIMEOUT_MS || '90000', 10);
+const IMAGE_SIZE = process.env.IMAGE_SIZE || '1536x1024';
+const IMAGE_QUALITY = process.env.IMAGE_QUALITY || 'high';
+const MAX_REFERENCE_IMAGES = parseInt(process.env.MAX_REFERENCE_IMAGES || '3', 10);
+
+// HTTP client with keep-alive and timeout
+const axiosOpenAI = axios.create({
+  timeout: HTTP_TIMEOUT,
+  httpAgent: new http.Agent({ keepAlive: true }),
+  httpsAgent: new https.Agent({ keepAlive: true })
+});
 
 // Ensure uploads directory exists
 if (!fs.existsSync(UPLOADS_DIR)) {
@@ -43,27 +59,51 @@ async function generateImage(ideaId, prompt, references = []) {
     );
     console.log(`Updated status to processing for idea ${ideaId}`);
 
+    // Publish SSE update for processing state so clients can recompute running count
+    try {
+      const [rows] = await pool.execute('SELECT title_id FROM ideas WHERE id = ?', [ideaId]);
+      const titleIdForSse = rows && rows[0] && rows[0].title_id;
+      if (titleIdForSse) {
+        sse.publish(titleIdForSse, { type: 'paintingUpdated', payload: { ideaId, status: 'processing' } });
+      }
+    } catch (e) {
+      console.warn('Failed to publish processing SSE update:', e?.message || e);
+    }
+
     let response;
+
+    // Limit reference images to reduce payload and processing time
+    // Shuffle and randomly choose a subset to increase variation between runs
+    const refsArray = Array.isArray(references) ? [...references] : [];
+    for (let i = refsArray.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = refsArray[i];
+      refsArray[i] = refsArray[j];
+      refsArray[j] = tmp;
+    }
+    const maxRefCount = Math.min(MAX_REFERENCE_IMAGES, refsArray.length);
+    const chosenCount = maxRefCount > 0 ? Math.floor(Math.random() * (maxRefCount + 1)) : 0; // 0..maxRefCount
+    const refsToUse = refsArray.slice(0, chosenCount);
     
-    if (references && references.length > 0) {
-      console.log(`Using ${references.length} reference images for edits endpoint`);
+    if (refsToUse && refsToUse.length > 0) {
+      console.log(`Using ${refsToUse.length} reference images for edits endpoint`);
       // Use the edits endpoint when there are reference images
       const formData = new FormData();
       formData.append('model', 'gpt-image-1');
       formData.append('prompt', prompt);
-      formData.append('size', '1536x1024');
-      formData.append('quality', 'high');
+      formData.append('size', IMAGE_SIZE);
+      formData.append('quality', IMAGE_QUALITY);
       
       // Add reference images
-      for (const ref of references) {
+      for (const ref of refsToUse) {
         try {
           // Extract base64 data
           const base64Data = ref.image_data.split(',')[1];
           const buffer = Buffer.from(base64Data, 'base64');
           const tempFilePath = path.join(UPLOADS_DIR, `temp_${Date.now()}_${Math.random().toString(36).substring(7)}.png`);
           
-          // Save to temp file
-          fs.writeFileSync(tempFilePath, buffer);
+          // Save to temp file (async)
+          await fs.promises.writeFile(tempFilePath, buffer);
           console.log(`Created temp file ${tempFilePath}`);
           
           // Append to form
@@ -79,7 +119,7 @@ async function generateImage(ideaId, prompt, references = []) {
       
       try {
         console.log('Making request to OpenAI edits endpoint');
-        response = await axios.post('https://api.openai.com/v1/images/edits', formData, {
+        response = await axiosOpenAI.post('https://api.openai.com/v1/images/edits', formData, {
           headers: {
             'Authorization': `Bearer ${OPENAI_API_KEY}`,
             ...formData.getHeaders()
@@ -102,12 +142,10 @@ async function generateImage(ideaId, prompt, references = []) {
           throw error;
         }
       } finally {
-        // Cleanup temp files
+        // Cleanup temp files (async, ignore errors)
         for (const tempFile of tempFiles) {
-          if (fs.existsSync(tempFile)) {
-            fs.unlinkSync(tempFile);
-            console.log(`Deleted temp file ${tempFile}`);
-          }
+          await fs.promises.unlink(tempFile).catch(() => {});
+          console.log(`Deleted temp file ${tempFile}`);
         }
       }
     } else {
@@ -117,12 +155,12 @@ async function generateImage(ideaId, prompt, references = []) {
         const requestBody = {
           model: 'gpt-image-1',
           prompt: prompt,
-          quality: 'high',
-          size: '1536x1024'
+          quality: IMAGE_QUALITY,
+          size: IMAGE_SIZE
         };
         console.log('Making request to OpenAI generations endpoint with payload:', JSON.stringify(requestBody, null, 2));
         
-        response = await axios.post('https://api.openai.com/v1/images/generations', requestBody, {
+        response = await axiosOpenAI.post('https://api.openai.com/v1/images/generations', requestBody, {
           headers: {
             'Authorization': `Bearer ${OPENAI_API_KEY}`,
             'Content-Type': 'application/json'
@@ -157,7 +195,7 @@ async function generateImage(ideaId, prompt, references = []) {
         } else if (response.data.data[0].url) {
           // If we got a URL instead of base64, we need to download the image
           console.log('Received URL instead of base64, downloading image...');
-          const imageResponse = await axios.get(response.data.data[0].url, { responseType: 'arraybuffer' });
+          const imageResponse = await axiosOpenAI.get(response.data.data[0].url, { responseType: 'arraybuffer' });
           imageData = Buffer.from(imageResponse.data).toString('base64');
         } else {
           throw new Error('No image data found in response');
@@ -170,17 +208,17 @@ async function generateImage(ideaId, prompt, references = []) {
       throw new Error('Invalid response format from OpenAI API');
     }
 
-    // Save image to disk
+    // Save image to disk (async)
     const fileName = `painting_${ideaId}_${Date.now()}.png`;
     const filePath = path.join(UPLOADS_DIR, fileName);
-    fs.writeFileSync(filePath, Buffer.from(imageData, 'base64'));
+    await fs.promises.writeFile(filePath, Buffer.from(imageData, 'base64'));
     console.log(`Saved image to ${filePath}`);
 
-    const referenceIds = references.map(ref => ref.id).filter(id => id != null);
+    const referenceIds = refsToUse.map(ref => ref.id).filter(id => id != null);
     const usedReferenceIdsJSON = referenceIds.length > 0 ? JSON.stringify(referenceIds) : null;
 
-    // Update database with image URL and status
-    const completeUpdateParams = [`uploads/${fileName}`, `data:image/png;base64,${imageData}`, 'completed', usedReferenceIdsJSON, ideaId];
+    // Update database with image URL and status (no base64 blob)
+    const completeUpdateParams = [`uploads/${fileName}`, 'completed', usedReferenceIdsJSON, ideaId];
     // Validate parameters
     if (completeUpdateParams.some(p => p === undefined)) {
       console.error('Attempted to execute query with undefined parameter:', { completeUpdateParams });
@@ -188,7 +226,7 @@ async function generateImage(ideaId, prompt, references = []) {
     }
     
     await pool.execute(
-      'UPDATE paintings SET image_url = ?, image_data = ?, status = ?, used_reference_ids = ? WHERE idea_id = ?',
+      'UPDATE paintings SET image_url = ?, status = ?, used_reference_ids = ? WHERE idea_id = ?',
       completeUpdateParams
     );
     console.log(`Updated database status to completed for idea ${ideaId}`);
